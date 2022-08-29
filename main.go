@@ -76,7 +76,7 @@ func ifelse(pred predicate.BoolPredicate, a, b interface{}) interface{} {
 	return b
 }
 
-func concat(args ...interface{}) ([]string, error) {
+func list(args ...interface{}) ([]string, error) {
 	var out []string
 	for _, arg := range args {
 		switch a := arg.(type) {
@@ -85,10 +85,55 @@ func concat(args ...interface{}) ([]string, error) {
 		case []string:
 			out = append(out, a...)
 		default:
-			return nil, trace.BadParameter("args to concat must be string or []string, got %T", arg)
+			return nil, trace.BadParameter("args to list must be string or []string, got %T", arg)
 		}
 	}
 	return out, nil
+}
+
+type stringMatcher string
+
+func (s stringMatcher) matches(value interface{}) bool {
+	if valueStr, ok := value.(string); ok {
+		return valueStr == string(s)
+	}
+	return false
+}
+
+type defaultMatcher struct{}
+
+func (_ defaultMatcher) matches(_ interface{}) bool {
+	return true
+}
+
+type matcher interface {
+	matches(interface{}) bool
+}
+
+type option struct {
+	matcher matcher
+	value   interface{}
+}
+
+func newOption(m interface{}, value interface{}) (option, error) {
+	switch m_type := m.(type) {
+	case string:
+		return option{stringMatcher(m_type), value}, nil
+	}
+	return option{}, trace.BadParameter("unsupported matcher type %T", m)
+}
+
+func newDefaultOption(value interface{}) option {
+	return option{defaultMatcher{}, value}
+}
+
+func match(input interface{}, options ...option) (interface{}, error) {
+	for _, opt := range options {
+		if opt.matcher.matches(input) {
+			return opt.value, nil
+		}
+	}
+	return nil, trace.NotFound("no matching option")
 }
 
 func newParser(traits map[string][]string) predicate.Parser {
@@ -99,14 +144,17 @@ func newParser(traits map[string][]string) predicate.Parser {
 			NOT: predicate.Not,
 		},
 		Functions: map[string]interface{}{
-			"equals":    predicate.Equals,
-			"contains":  predicate.Contains,
-			"matches":   matches,
-			"filter":    filter,
-			"transform": transform,
-			"replace":   replace,
-			"ifelse":    ifelse,
-			"concat":    concat,
+			"equals":         predicate.Equals,
+			"contains":       predicate.Contains,
+			"matches":        matches,
+			"filter":         filter,
+			"transform":      transform,
+			"replace":        replace,
+			"ifelse":         ifelse,
+			"list":           list,
+			"option":         newOption,
+			"match":          match,
+			"default_option": newDefaultOption,
 		},
 		GetIdentifier: func(fields []string) (interface{}, error) {
 			switch len(fields) {
@@ -159,35 +207,49 @@ func main() {
 	eval(parser, `transform(external.username, replace("-", "_"))`)
 
 	eval(parser, `
-concat(
+list(
 	"ubuntu",
 	transform(external.username, replace("-", "_")),
-	ifelse(contains(external.email, "nic@goteleport.com"), "root", concat()),
+	ifelse(contains(external.email, "nic@goteleport.com"), "root", list()),
 	transform(filter(external.email, matches("@goteleport.com")), replace("^(.*)@goteleport.com", "$1")),
 )
 `)
 
 	eval(parser, `
-concat(
+list(
 	transform(
 		filter(external.groups, matches("^env-\\w+$")),
 		replace("^env-(\\w+)$", "$1")),
 	ifelse(
 		contains(external.groups, "contractors"),
-		concat(),
-		transform(external.groups, replace("^devs$", "dev"))),
-)`)
+		list(),
+		ifelse(contains(external.groups, "devs"), "dev", list())))
+`)
 
 	eval(parser, `
-concat(
+list(
 	ifelse(
 		contains(external.groups, "devs"),
-		concat("dev", "staging"),
-		concat()),
+		list("dev", "staging"),
+		list()),
 	ifelse(
 		contains(external.groups, "qa"),
 		"qa",
-		concat()),
+		list()),
 )
 `)
+
+	eval(parser, `list(list("a", "b"), "c")`)
+	eval(parser, `option("a", list("b", "c"))`)
+	eval(parser, `
+match("asdf",
+  option("asdf", list("a", "b", "c")),
+  option("a", list("b", "c")))`)
+	eval(parser, `
+match("asdfzxcv",
+  option("asdf", list("a", "b", "c")),
+  option("a", list("b", "c")),
+  option("asdfzxcv", list(external.groups, "b", "c")),
+  default_option(list("default")),
+  )`)
 }
